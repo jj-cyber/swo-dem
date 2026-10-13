@@ -1,23 +1,23 @@
-"""List DEM checks (Website, Uri, SyntheticTransaction, PageSpeed) with their native status.
+"""List SWO DEM availability checks (Website and Uri entities) with their native status.
 
 Uses the SolarWinds Observability REST API:
 
-- ``GET /v1/entities?type=<DEM entity type>`` (paginated). The entity attributes carry the
+- ``GET /v1/entities?type=Website|Uri`` (paginated). The entity attributes carry the
   status (``state.nativeState``: up, down, paused, maintenance, unknown), the target
   (``url`` or ``host``) and, for a URI, its protocol (PING, DNS, TCP, UDP).
 - ``--details`` also calls ``GET /v1/dem/websites/{id}`` or ``GET /v1/dem/uris/{id}`` per
-  Website and Uri for response time, last test time and TCP port. The same call is the
-  fallback when an entity has no native status.
+  check for response time, last test time and TCP port. The same call is the fallback when
+  an entity has no native status.
 
 Environment: ``SWO_TOKEN`` (required), ``SWO_REGION`` or ``SWO_BASE_URL`` (optional).
 
 Examples::
 
-    python examples/01_list_availability_checks.py
-    python examples/01_list_availability_checks.py --types website,uri --csv
-    python examples/01_list_availability_checks.py --types tcp --details --json
-    python examples/01_list_availability_checks.py --fail-on-down
-    python examples/01_list_availability_checks.py --types all --limit 10
+    python list_availability_checks.py
+    python list_availability_checks.py --types website,uri --csv
+    python list_availability_checks.py --types tcp --details --json
+    python list_availability_checks.py --fail-on-down
+    python list_availability_checks.py --types all --limit 10
 """
 
 import argparse
@@ -28,20 +28,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Make the repository root importable when this file is run directly.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from swo_dem import MissingTokenError, SwoApiError, SwoClient  # noqa: E402
 
-# DEM entity types.
+# Availability checks are the Website and Uri entities. The other DEM entity types
+# (SyntheticTransaction, PageSpeed) belong to other DEM features and other examples.
 WEBSITE = "Website"
 URI = "Uri"
-SYNTHETIC_TRANSACTION = "SyntheticTransaction"
-PAGESPEED = "PageSpeed"
-ENTITY_TYPES = (WEBSITE, URI, SYNTHETIC_TRANSACTION, PAGESPEED)
+ENTITY_TYPES = (WEBSITE, URI)
 # Uri checks are told apart by their protocol; each is selectable on its own.
 URI_KINDS = ("tcp", "ping", "dns", "udp")
 DEFAULT_TYPES = (WEBSITE,)
-# Only these have a DEM configuration endpoint for ``--details``.
 CONFIG_PATHS = {WEBSITE: "dem/websites", URI: "dem/uris"}
 NATIVE_STATUS_ATTRIBUTE = "state.nativeState"
 PAGE_SIZE = 100
@@ -141,8 +139,7 @@ def collect_checks(client, selectors, details=False, workers=32, limit=None):
     and their detail calls are never requested. The rows are the first ones the API
     returns, not the first after sorting.
 
-    Detail calls (Website and Uri only) run when ``details`` is set or a row lacks its
-    status. A failing call keeps the row and never aborts the run.
+    Detail calls run when ``details`` is set or a row lacks its status. A failing call keeps the row and never aborts the run.
     """
     wanted = [
         entity_type for entity_type in ENTITY_TYPES
@@ -159,7 +156,7 @@ def collect_checks(client, selectors, details=False, workers=32, limit=None):
             if entity_type == URI and URI not in selectors and row["kind"] not in selectors:
                 continue
             rows.append(row)
-            if entity_type in CONFIG_PATHS and (details or row["status"] is None):
+            if details or row["status"] is None:
                 pending.append((entity_type, row))
             if len(rows) >= max_rows:
                 break
@@ -203,14 +200,13 @@ def build_parser():
         "--types",
         type=parse_types,
         default=DEFAULT_TYPES,
-        help="comma-separated: website, uri (all Uri checks), synthetictransaction, pagespeed, "
-             "or a single Uri protocol: tcp, ping, dns, udp; 'all' for every entity type "
-             "(default: website)",
+        help="comma-separated: website, uri (all Uri checks) or a single Uri protocol: "
+             "tcp, ping, dns, udp; 'all' for website and uri (default: website)",
     )
     parser.add_argument(
         "--details",
         action="store_true",
-        help="also fetch each Website/Uri DEM configuration: response time, last test, TCP port "
+        help="also fetch each check's DEM configuration: response time, last test, TCP port "
              "(one extra API call per check)",
     )
     parser.add_argument(
