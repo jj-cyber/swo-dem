@@ -1,18 +1,13 @@
-"""List DEM availability checks (Website, URI protocols) with their native status.
+"""List DEM checks (Website, Uri, SyntheticTransaction, PageSpeed) with their native status.
 
 Uses the SolarWinds Observability REST API:
 
-- ``GET /v1/entities?type=Website`` and ``GET /v1/entities?type=Uri`` (paginated).
-  Each entity carries everything the default report needs in ``attributes``:
-
-  - ``state.nativeState``: availability (up, down, paused, maintenance, unknown)
-  - ``protocols``: check protocol of a URI (PING, DNS, TCP, UDP)
-  - ``url`` (websites) or ``host`` (URIs): the target
-
-- ``--details`` additionally calls ``GET /v1/dem/websites/{id}`` or
-  ``GET /v1/dem/uris/{id}`` for each check to add response time, last test time
-  and the TCP port. Those calls also run as a fallback when an entity has no
-  native status in its attributes.
+- ``GET /v1/entities?type=<DEM entity type>`` (paginated). The entity attributes carry the
+  status (``state.nativeState``: up, down, paused, maintenance, unknown), the target
+  (``url`` or ``host``) and, for a URI, its protocol (PING, DNS, TCP, UDP).
+- ``--details`` also calls ``GET /v1/dem/websites/{id}`` or ``GET /v1/dem/uris/{id}`` per
+  Website and Uri for response time, last test time and TCP port. The same call is the
+  fallback when an entity has no native status.
 
 Environment: ``SWO_TOKEN`` (required), ``SWO_REGION`` or ``SWO_BASE_URL`` (optional).
 
@@ -37,12 +32,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from swo_dem import MissingTokenError, SwoApiError, SwoClient  # noqa: E402
 
+# DEM entity types.
 WEBSITE = "Website"
 URI = "Uri"
+SYNTHETIC_TRANSACTION = "SyntheticTransaction"
+PAGESPEED = "PageSpeed"
+ENTITY_TYPES = (WEBSITE, URI, SYNTHETIC_TRANSACTION, PAGESPEED)
+# Uri checks are told apart by their protocol; each is selectable on its own.
 URI_KINDS = ("tcp", "ping", "dns", "udp")
-ALL_KINDS = ("website",) + URI_KINDS
-KIND_GROUPS = {"uri": URI_KINDS, "all": ALL_KINDS}
-DEFAULT_KINDS = ("website",)
+DEFAULT_TYPES = (WEBSITE,)
+# Only these have a DEM configuration endpoint for ``--details``.
 CONFIG_PATHS = {WEBSITE: "dem/websites", URI: "dem/uris"}
 NATIVE_STATUS_ATTRIBUTE = "state.nativeState"
 PAGE_SIZE = 100
@@ -63,25 +62,20 @@ FIELDS = [
 ]
 
 
-def parse_kinds(value):
-    """Turn ``--types`` into a validated, de-duplicated tuple of check kinds.
-
-    Groups expand to their members: ``uri`` means every URI check (tcp, ping,
-    dns, udp) and ``all`` means every kind.
-    """
-    kinds = []
-    for item in value.split(","):
-        item = item.strip().lower()
-        if not item:
-            continue
-        if item not in ALL_KINDS and item not in KIND_GROUPS:
+def parse_types(value):
+    """Turn ``--types`` into a de-duplicated tuple of entity types and/or Uri protocols."""
+    choices = {entity_type.lower(): (entity_type,) for entity_type in ENTITY_TYPES}
+    choices.update({kind: (kind,) for kind in URI_KINDS})
+    choices["all"] = ENTITY_TYPES
+    selectors = []
+    for item in value.lower().split(","):
+        item = item.strip()
+        if item and item not in choices:
             raise argparse.ArgumentTypeError(
-                f"unknown check type {item!r}; choose from {', '.join(ALL_KINDS + ('uri',))} or 'all'"
+                f"unknown type {item!r}; choose from {', '.join(choices)}"
             )
-        for kind in KIND_GROUPS.get(item, (item,)):
-            if kind not in kinds:
-                kinds.append(kind)
-    return tuple(kinds)
+        selectors += [m for m in choices.get(item, ()) if m not in selectors]
+    return tuple(selectors)
 
 
 def positive_int(value):
@@ -95,33 +89,19 @@ def positive_int(value):
     return number
 
 
-def list_entities(client, entity_type):
-    """Yield every entity of ``entity_type`` (follows pagination)."""
-    yield from client.paginate(
-        "entities", "entities", {"type": entity_type, "pageSize": PAGE_SIZE}
-    )
-
-
-def entity_kind(entity):
-    """``website``, or the URI protocol in lower case (ping, dns, tcp, udp)."""
-    if entity["type"] == WEBSITE:
-        return "website"
-    protocols = (entity.get("attributes") or {}).get("protocols") or []
-    return protocols[0].lower() if protocols else "unknown"
-
-
 def row_from_entity(entity):
     """Build a report row from the entity list alone (no extra API call)."""
     attributes = entity.get("attributes") or {}
-    kind = entity_kind(entity)
-    if kind == "website":
-        target = attributes.get("url", "")
+    if entity["type"] == URI:
+        protocols = attributes.get("protocols") or ["unknown"]
+        kind = protocols[0].lower()
     else:
-        target = attributes.get("host") or attributes.get("hostname") or ""
+        kind = entity["type"].lower()
+    target = attributes.get("url") if kind == "website" else attributes.get("host")
     return {
         "name": entity.get("displayName") or entity.get("name", ""),
         "kind": kind,
-        "target": target,
+        "target": target or attributes.get("hostname") or "",
         "port": attributes.get("port") if kind == "tcp" else None,
         "status": attributes.get(NATIVE_STATUS_ATTRIBUTE) or None,
         "last_test_time": None,
@@ -132,73 +112,60 @@ def row_from_entity(entity):
     }
 
 
-def apply_config(row, config):
-    """Fill a row from its DEM configuration (``--details`` or fallback)."""
-    settings = config.get("availabilityCheckSettings") or {}
-    if row["status"] is None:
-        row["status"] = config.get("status") or None
-    if not row["target"]:
-        row["target"] = config.get("url") or config.get("ipOrDomain") or ""
+def fetch_details(client, entity_type, row):
+    """Fill a row from its DEM configuration. A failure is recorded in ``message``."""
+    try:
+        config = client.get(f"{CONFIG_PATHS[entity_type]}/{row['entity_id']}")
+        if not isinstance(config, dict):
+            raise ValueError("unexpected response body (not a JSON object)")
+    except (SwoApiError, OSError, ValueError) as error:
+        row["message"] = str(error)
+        row["status"] = row["status"] or "error"
+        return
+    row["status"] = row["status"] or config.get("status")
+    row["target"] = row["target"] or config.get("url") or config.get("ipOrDomain") or ""
     if row["kind"] == "tcp" and row["port"] is None:
-        row["port"] = (settings.get("tcp") or {}).get("port")
+        row["port"] = ((config.get("availabilityCheckSettings") or {}).get("tcp") or {}).get("port")
     row["last_test_time"] = config.get("lastTestTime")
     row["last_response_ms"] = config.get("lastResponseTime")
     row["last_error_time"] = config.get("lastErrorTime")
 
 
-def needs_config(row, details):
-    """True when a row needs its DEM configuration to be complete."""
-    if details or row["status"] is None:
-        return True
-    return row["kind"] == "tcp" and row["port"] is None
+def collect_checks(client, selectors, details=False, workers=32, limit=None):
+    """Return report rows for every entity matching ``selectors`` (see ``parse_types``).
 
+    The ``Uri`` entity type takes every Uri check; protocol kinds (e.g. ``tcp``) alone
+    keep just the Uri checks of those protocols.
 
-def collect_checks(client, kinds, details=False, workers=32, limit=None):
-    """Return report rows for every entity whose check kind is in ``kinds``.
+    With ``limit`` the listing stops once that many rows are collected, so later pages
+    and their detail calls are never requested. The rows are the first ones the API
+    returns, not the first after sorting.
 
-    With ``limit`` the listing stops once that many rows are collected, so
-    later pages and their detail calls are never requested. The rows are the
-    first ones the API returns, not the first after sorting.
-
-    Only the entity lists are fetched unless ``details`` is set or a row lacks
-    its status or TCP port. A failing detail call keeps the row and records the
-    error in ``message``; it never aborts the run.
+    Detail calls (Website and Uri only) run when ``details`` is set or a row lacks its
+    status. A failing call keeps the row and never aborts the run.
     """
-    entity_types = []
-    if "website" in kinds:
-        entity_types.append(WEBSITE)
-    if any(kind in kinds for kind in URI_KINDS):
-        entity_types.append(URI)
-
-    pending = []
-    rows = []
-    for entity_type in entity_types:
-        if limit is not None and len(rows) >= limit:
-            break
-        for entity in list_entities(client, entity_type):
+    wanted = [
+        entity_type for entity_type in ENTITY_TYPES
+        if entity_type in selectors or (entity_type == URI and set(URI_KINDS) & set(selectors))
+    ]
+    max_rows = limit or float("inf")
+    rows, pending = [], []
+    for entity_type in wanted:
+        params = {"type": entity_type, "pageSize": PAGE_SIZE}
+        for entity in client.paginate("entities", "entities", params):
+            if len(rows) >= max_rows:
+                break
             row = row_from_entity(entity)
-            if row["kind"] not in kinds:
+            if entity_type == URI and URI not in selectors and row["kind"] not in selectors:
                 continue
             rows.append(row)
-            if needs_config(row, details):
-                pending.append((entity, row))
-            if limit is not None and len(rows) >= limit:
+            if entity_type in CONFIG_PATHS and (details or row["status"] is None):
+                pending.append((entity_type, row))
+            if len(rows) >= max_rows:
                 break
 
-    def enrich(pair):
-        entity, row = pair
-        try:
-            config = client.get(f"{CONFIG_PATHS[entity['type']]}/{entity['id']}")
-            if not isinstance(config, dict):
-                raise ValueError("unexpected response body (not a JSON object)")
-            apply_config(row, config)
-        except (SwoApiError, OSError, ValueError) as error:
-            row["message"] = str(error)
-            if row["status"] is None:
-                row["status"] = "error"
-
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(enrich, pending))
+        list(pool.map(lambda pair: fetch_details(client, *pair), pending))
 
     for row in rows:
         row["status"] = row["status"] or "unknown"
@@ -212,24 +179,16 @@ def sort_rows(rows):
 
 def render_table(rows):
     """Plain-text, column-aligned table."""
-    headers = ["NAME", "KIND", "TARGET", "STATUS", "LAST TEST", "RESPONSE MS"]
-    lines = [
-        [row["name"], _kind_label(row), row["target"], row["status"],
-         row["last_test_time"] or "-", _text(row["last_response_ms"])]
-        for row in rows
-    ]
-    table = [headers] + lines
+    table = [["NAME", "KIND", "TARGET", "STATUS", "LAST TEST", "RESPONSE MS"]]
+    for row in rows:
+        kind = f"{row['kind']}:{row['port']}" if row["port"] else row["kind"]
+        response = "-" if row["last_response_ms"] is None else row["last_response_ms"]
+        table.append([row["name"], kind, row["target"], row["status"],
+                      row["last_test_time"] or "-", response])
     widths = [max(len(str(cell)) for cell in column) for column in zip(*table)]
-    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
-    return "\n".join(fmt.format(*(str(cell) for cell in line)) for line in table)
-
-
-def _kind_label(row):
-    return f"{row['kind']}:{row['port']}" if row["port"] else row["kind"]
-
-
-def _text(value):
-    return "-" if value is None else str(value)
+    return "\n".join(
+        "  ".join(str(cell).ljust(width) for cell, width in zip(line, widths)) for line in table
+    )
 
 
 def render_csv(rows, stream):
@@ -242,15 +201,16 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--types",
-        type=parse_kinds,
-        default=DEFAULT_KINDS,
-        help="comma-separated: website, uri (all URI checks), or any of tcp,ping,dns,udp; "
-             "'all' for everything (default: website)",
+        type=parse_types,
+        default=DEFAULT_TYPES,
+        help="comma-separated: website, uri (all Uri checks), synthetictransaction, pagespeed, "
+             "or a single Uri protocol: tcp, ping, dns, udp; 'all' for every entity type "
+             "(default: website)",
     )
     parser.add_argument(
         "--details",
         action="store_true",
-        help="also fetch each check's DEM configuration: response time, last test, TCP port "
+        help="also fetch each Website/Uri DEM configuration: response time, last test, TCP port "
              "(one extra API call per check)",
     )
     parser.add_argument(
