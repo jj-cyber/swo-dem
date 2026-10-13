@@ -24,6 +24,18 @@ features:
 
 ## Setup (Python examples)
 
+First create an API token (organization owners and admins only):
+
+1. In SWO, go to **Settings > API Tokens** and click **Create API token**.
+2. Enter a name, select the type **API Access** and create the token.
+3. Copy the token. You pass it to the examples as `SWO_TOKEN`.
+
+Details are in the [API tokens documentation](https://documentation.solarwinds.com/en/success_center/observability/content/settings/api-tokens.htm).
+An API Access token can also create, modify and delete data (for example a website check), so
+keep it secret.
+
+Then set up the environment:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -37,8 +49,6 @@ Optional settings:
 |----------|---------|---------|
 | `SWO_REGION` | `na-01` | Data center; base URL becomes `https://api.<region>.cloud.solarwinds.com/v1` |
 | `SWO_BASE_URL` | — | Full base URL; overrides `SWO_REGION` |
-
-The token is read only from the environment and is never printed.
 
 ## Layout
 
