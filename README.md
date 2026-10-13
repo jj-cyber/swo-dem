@@ -4,6 +4,13 @@ Examples for the Digital Experience Monitoring (DEM) features of the SolarWinds 
 (SWO) SaaS **REST API**. Each example covers one DEM feature and may exist in more than one
 programming language.
 
+> **Unofficial project.** This is not an official SolarWinds repository and is not affiliated
+> with, endorsed or supported by SolarWinds. The examples are based only on the public SWO REST
+> API and the public SolarWinds Observability documentation. SolarWinds and SolarWinds
+> Observability are trademarks of SolarWinds Worldwide, LLC. Use the examples at your own risk
+> and check the [official documentation](https://documentation.solarwinds.com/en/success_center/observability/content/observability_getting_started_guide.htm)
+> for the current API behaviour.
+
 ## DEM features and examples
 
 The API exposes four DEM entity types (`GET /v1/entities?type=<type>`), which belong to three
